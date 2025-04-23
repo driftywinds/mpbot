@@ -7,8 +7,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
-COPY . .
+COPY DMbotfly.py .
+#COPY GTbotfly.py . # if you want to run the bot in a private group
 
 # Run the bot
 CMD ["python", "DMbotfly.py"]
-#CMD ["python", "GTbotfly.py"] if you want to run the bot in a private group
+#CMD ["python", "GTbotfly.py"] # if you want to run the bot in a private group
