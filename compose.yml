@@ -1,0 +1,10 @@
+version: '3.8'
+
+services:
+  gtbot:
+#    build: .
+    image: driftywinds/mpbot:v1.0.0 
+    container_name: mpbot
+    env_file:
+      - .env
+    restart: unless-stopped
