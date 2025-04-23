@@ -3,7 +3,7 @@ version: '3.8'
 services:
   gtbot:
 #    build: .
-    image: driftywinds/mpbot:v1.0.0 
+    image: driftywinds/mpbot:latest
     container_name: mpbot
     env_file:
       - .env
