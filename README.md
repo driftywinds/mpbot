@@ -13,6 +13,7 @@ How to use: -
 ## B. Build image and deploy bot for DMs - 
 
 - Clone / download the repo
+- change the ```Dockerfile``` according to which bot you want to use. ```GTbotfly.py``` is for <ins>**G**</ins>roups with <ins>**T**</ins>opics and ```DMflybot.py``` is for <ins>**DM**</ins>s
 - run ```docker build -t mpbot .```
 - edit ```compose.yml``` line to use the currently build image (change the ```image: driftywinds/mpbot:v1.0.0``` line to ```image: mpbot```)
 - edit ```.env``` accordingly
