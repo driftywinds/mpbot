@@ -2,6 +2,7 @@ import os
 import requests
 import base64
 import re
+import json
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -13,61 +14,140 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ALLOWED_CHAT_ID = int(os.getenv("ALLOWED_CHAT_ID", "-1002645206555"))  # Convert to integer
 ALLOWED_THREAD_ID = int(os.getenv("ALLOWED_THREAD_ID", "760"))         # Convert to integer
 
+
 # UUID validation pattern
 UUID_PATTERN = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
 
 def log_activity(message: str) -> None:
-    """Log messages with timestamp to console"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}")
 
 def validate_topic(update: Update) -> bool:
-    """Check if message is in the allowed topic"""
     return (update.effective_chat.id == ALLOWED_CHAT_ID and 
             update.effective_message.message_thread_id == ALLOWED_THREAD_ID)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if validate_topic(update):
-        await send_response(update, context, 'Hello! Send me an addon UUID to get information about it.')
+        help_text = (
+            "Hello! I can help you find addons.\n\n"
+            "🔍 Search by name/creator: Type any search term\n"
+            "🔎 Get by UUID: Paste a valid UUID\n"
+            "❌ Cancel ongoing search: Type /cancel or 'cancel'"
+        )
+        await send_response(update, context, help_text)
 
-async def handle_uuid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Log incoming message
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get('awaiting_index'):
+        context.user_data.clear()
+        await send_response(update, context, "❌ Search cancelled. You can start a new search.")
+        log_activity("Search cancelled by user")
+    else:
+        await send_response(update, context, "⚠️ No active operation to cancel")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_info = f"@{update.effective_user.username}" if update.effective_user.username else "Unknown User"
-    log_activity(f"Received message from {user_info} (Chat: {update.effective_chat.id}, Thread: {update.effective_message.message_thread_id}): '{update.message.text}'")
+    log_activity(f"Received message from {user_info}: '{update.message.text}'")
 
     if not validate_topic(update):
         log_activity("Message ignored - not in allowed topic")
         return
 
-    uuid = update.message.text.strip()
-    
-    # Validate UUID format
-    if not UUID_PATTERN.match(uuid):
-        await send_response(update, context, "❌ That is not a valid UUID format. Please send a properly formatted UUID.")
-        log_activity(f"Invalid UUID format received: {uuid}")
+    user_input = update.message.text.strip().lower()
+
+    # Handle cancellation first
+    if user_input in ['cancel', 'abort']:
+        await cancel(update, context)
         return
 
+    # Check if expecting index selection
+    if context.user_data.get('awaiting_index'):
+        try:
+            index = int(user_input) - 1
+            search_results = context.user_data.get('search_results', [])
+            if 0 <= index < len(search_results):
+                selected_uuid = search_results[index]['uuid']
+                context.user_data.clear()
+                await process_uuid(update, context, selected_uuid)
+            else:
+                await send_response(update, context, "❌ Invalid index. Type /cancel to abort.")
+        except ValueError:
+            await send_response(update, context, "❌ Please enter a valid number or type /cancel to abort")
+        return
+
+    # Check if input is UUID
+    if UUID_PATTERN.match(user_input):
+        await process_uuid(update, context, user_input)
+    else:
+        await perform_search(update, context, user_input)
+
+async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
     try:
-        log_activity(f"Processing UUID: {uuid}")
+        log_activity(f"Searching for: {query}")
+        headers = {"Authorization": f"Bearer {BEARER_TOKEN}"}
+        
+        # Directus filter parameters
+        search_params = {
+            "filter": json.dumps({
+                "_or": [
+                    {"name": {"_icontains": query}},
+                    {"creator": {"_icontains": query}}
+                ]
+            }),
+            "fields": "uuid,name,creator,version,download_hash",
+            "limit": "10"
+        }
+
+        response = requests.get(
+            url=f"{API_BASE_URL}",
+            headers=headers,
+            params=search_params
+        )
+        response.raise_for_status()
+        
+        # Directus returns items directly in data array
+        search_data = response.json().get('data', [])
+        
+        if not search_data:
+            await send_response(update, context, "🔍 No results found for your query.")
+            return
+
+        context.user_data['search_results'] = search_data
+        context.user_data['awaiting_index'] = True
+
+        results_list = [
+            f"{idx}. {item.get('name', 'N/A')} by {item.get('creator', 'N/A')}"
+            for idx, item in enumerate(search_data, 1)
+        ]
+        
+        response_message = "🔍 Search Results:\n" + "\n".join(results_list) + "\n\nReply with the number to view details:"
+        await send_response(update, context, response_message)
+
+    except requests.exceptions.HTTPError as e:
+        error_msg = f"🔧 API Error: {e.response.status_code}"
+        await send_response(update, context, error_msg)
+        log_activity(f"Search API Error: {str(e)}")
+    except Exception as e:
+        log_activity(f"Search error: {str(e)}")
+        await send_response(update, context, "⚠️ Error processing search")
+
+async def process_uuid(update: Update, context: ContextTypes.DEFAULT_TYPE, uuid: str) -> None:
+    try:
         headers = {"Authorization": f"Bearer {BEARER_TOKEN}"}
         response = requests.get(f"{API_BASE_URL}{uuid}", headers=headers)
         response.raise_for_status()
         
         data = response.json().get('data', {})
-        
         if data:
             download_hashes = data.get('download_hash', '')
             decoded_urls = []
             
             if download_hashes:
                 for i, hash_part in enumerate(download_hashes.split(','), 1):
-                    hash_part = hash_part.strip()
-                    if hash_part:
-                        try:
-                            decoded = base64.b64decode(hash_part).decode('utf-8')
-                            decoded_urls.append(f"{i}. {decoded}")
-                        except:
-                            decoded_urls.append(f"{i}. Invalid hash: {hash_part}")
+                    try:
+                        decoded = base64.b64decode(hash_part.strip()).decode('utf-8')
+                        decoded_urls.append(f"{i}. {decoded}")
+                    except:
+                        decoded_urls.append(f"{i}. Invalid hash")
 
             formatted_message = (
                 f"UUID: {data.get('uuid', 'N/A')}\n"
@@ -81,27 +161,20 @@ async def handle_uuid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             else:
                 formatted_message += "No download URLs found"
 
-            await send_response(update, context, f"Addon Information:\n{formatted_message}")
-            log_activity(f"Successfully responded to UUID: {uuid}")
+            await send_response(update, context, f"📦 Addon Information:\n{formatted_message}")
         else:
-            await send_response(update, context, "No information found for this UUID.")
-            log_activity(f"No data found for UUID: {uuid}")
-            
+            await send_response(update, context, "❌ No information found for this UUID.")
+
     except requests.exceptions.HTTPError as e:
-        log_activity(f"API Error for {uuid}: {str(e)}")
         if e.response.status_code == 403:
             await send_response(update, context, "⛔ Access denied for this UUID")
         else:
-            await send_response(update, context, f"🔧 API Error: {e.response.status_code} - Please try again later")
-    except requests.exceptions.RequestException as e:
-        log_activity(f"Connection error for {uuid}: {str(e)}")
-        await send_response(update, context, "🔌 Connection error - Please try again later")
+            await send_response(update, context, f"🔧 API Error: {e.response.status_code}")
     except Exception as e:
-        log_activity(f"Unexpected error processing {uuid}: {str(e)}")
-        await send_response(update, context, "⚠️ An unexpected error occurred - Please try again later")
+        log_activity(f"UUID processing error: {str(e)}")
+        await send_response(update, context, "⚠️ Error fetching UUID details")
 
 async def send_response(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    """Send response and log it to console"""
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         message_thread_id=update.effective_message.message_thread_id,
@@ -112,7 +185,13 @@ async def send_response(update: Update, context: ContextTypes.DEFAULT_TYPE, text
 def main() -> None:
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_uuid))
+    application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(MessageHandler(
+        filters.TEXT & 
+        ~filters.COMMAND & 
+        ~filters.Regex(re.compile(r'^(cancel|abort)$', flags=re.IGNORECASE)),
+        handle_text
+    ))
     application.run_polling()
 
 if __name__ == '__main__':
